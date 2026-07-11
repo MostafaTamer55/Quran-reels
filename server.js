@@ -2,7 +2,6 @@ const express = require('express');
 const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs');
-const axios = require('axios'); // للتواصل السريع مع الـ API الخارجي
 
 const app = express();
 app.use(express.json());
@@ -17,7 +16,7 @@ function formatSRTTime(seconds) {
     return `${timeString},${ms}`;
 }
 
-// دالة تنظيف النص من علامات الوقف والمربعات الغريبة []
+// دالة سحرية لتنظيف النص من علامات الوقف والمربعات الغريبة []
 function cleanArabicText(text) {
     if (!text) return "آية قرآنية";
     return text
@@ -46,21 +45,22 @@ app.post('/api/make-video', async (req, res) => {
     }
 
     try {
-        const surahNumber = surah_id || 2; // رقم السورة الافتراضي
+        const surahNumber = surah_id || 2; 
         const firstAyahNum = ayahs[0].numberInSurah;
-        const lastAyahNum = ayahs[ayahs.length - 1].numberInSurah;
 
         let startTimeSeconds = 0;
         let totalDuration = ayahs.length * 6; // افتراضي 6 ثواني لكل آية في حالة الفشل
 
         try {
-            // جلب التوقيت الدقيق جداً لأبو بكر الشاطري أونلاين بناءً على السورة
-            const timingResponse = await axios.get(`https://api.quran.com/api/v4/recitations/7/by_ayah/${surahNumber}:${firstAyahNum}`);
-            if (timingResponse.data && timingResponse.data.audio_files && timingResponse.data.audio_files[0]) {
-                const audioFile = timingResponse.data.audio_files[0];
-                // حساب وقت البداية من حقل الـ segments الحقيقي بالملي ثانية
-                if (audioFile.segments && audioFile.segments[0]) {
-                    startTimeSeconds = audioFile.segments[0][1] / 1000; // تحويل لثواني
+            // جلب التوقيت الدقيق جداً لأبو بكر الشاطري باستخدام fetch المدمج
+            const response = await fetch(`https://api.quran.com/api/v4/recitations/7/by_ayah/${surahNumber}:${firstAyahNum}`);
+            if (response.ok) {
+                const data = await response.json();
+                if (data && data.audio_files && data.audio_files[0]) {
+                    const audioFile = data.audio_files[0];
+                    if (audioFile.segments && audioFile.segments[0]) {
+                        startTimeSeconds = audioFile.segments[0][1] / 1000; // تحويل لثواني
+                    }
                 }
             }
         } catch (err) {
@@ -82,12 +82,9 @@ app.post('/api/make-video', async (req, res) => {
             srtContent += `${cleanText}\n\n`;
         });
 
-        // حفظ بترميز UTF-8 مع الـ BOM لمنع الحروف المتقطعة نهائياً في FFmpeg
         fs.writeFileSync(srtPath, '\ufeff' + srtContent, 'utf-8');
 
         let command = ffmpeg().input(audioUrl);
-        
-        // التقطيع من مكان الآيات الحقيقي بالظبط
         command.inputOptions([`-ss ${startTimeSeconds}`, `-t ${totalDuration}`]);
 
         if (fs.existsSync(bgImagePath)) {
@@ -98,7 +95,6 @@ app.post('/api/make-video', async (req, res) => {
 
         command
             .complexFilter([
-                // دمج الترجمة وحل مشكلة الخطوط والمربعات
                 `[1:v]subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,FontSize=22,Fontname=Arial,PrimaryColour=&HFFFFFF,Outline=2,OutlineColour=&H000000'[v]`
             ])
             .outputOptions([
