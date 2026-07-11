@@ -29,7 +29,7 @@ app.post('/api/make-video', async (req, res) => {
     const srtPath = path.join(__dirname, 'uploads', `sub_${timestamp}.srt`);
     const outputPath = path.join(__dirname, 'uploads', `video_${timestamp}.mp4`);
     const bgImagePath = path.join(__dirname, 'background.jpg'); 
-    const localFontPath = path.join(__dirname, 'Amiri-Regular.ttf'); // مسار الخط المحلي الجديد
+    const localFontPath = path.join(__dirname, 'Amiri-Regular.ttf'); 
 
     if (!fs.existsSync(path.join(__dirname, 'uploads'))) {
         fs.mkdirSync(path.join(__dirname, 'uploads'));
@@ -65,7 +65,7 @@ app.post('/api/make-video', async (req, res) => {
             command.input('color=c=0x111827:s=720x1280:r=25').inputOptions(['-f lavfi', `-t ${totalDuration}`]);
         }
 
-        // إعداد فلتر الخط لـ FFmpeg: لو ملف الـ ttf موجود عندك في الفولدر هيشغله أوتوماتيك لترجمة الرموز
+        // تم تصحيح الفلتر بالكامل ليكون متوافقاً مع معايير نظام Linux (Fontsize بحرف صغير)
         let fontStyle = '';
         if (fs.existsSync(localFontPath)) {
             fontStyle = `,Fontname=Amiri,Fontfile=${localFontPath.replace(/\\/g, '/')}`;
@@ -73,7 +73,7 @@ app.post('/api/make-video', async (req, res) => {
 
         command
             .complexFilter([
-                `[1:v]scale=720:1280,subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,FontSize=22,PrimaryColour=&HFFFFFF,Outline=2,OutlineColour=&H000000${fontStyle}'[v]`
+                `[1:v]scale=720:1280,subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,Fontsize=22,PrimaryColour=&HFFFFFF,Outline=2,OutlineColour=&H000000${fontStyle}'[v]`
             ])
             .outputOptions(['-map 0:a', '-map [v]', '-pix_fmt yuv420p', '-c:v libx264', '-preset ultrafast', '-c:a aac', '-shortest'])
             .output(outputPath)
