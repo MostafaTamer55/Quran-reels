@@ -30,7 +30,6 @@ function stripTashkeel(text) {
 }
 
 app.post('/api/make-video', async (req, res) => {
-    // قراءة الحقلين المتوقعين من n8n
     const { audioUrl, ayahs, surah_id } = req.body;
 
     if (!audioUrl || !ayahs || ayahs.length === 0) {
@@ -40,7 +39,7 @@ app.post('/api/make-video', async (req, res) => {
     const timestamp = Date.now();
     const srtPath = path.join(__dirname, 'uploads', `sub_${timestamp}.srt`);
     const outputPath = path.join(__dirname, 'uploads', `video_${timestamp}.mp4`);
-    const bgImagePath = path.join(__dirname, 'background.jpg'); // اسم ملفك على جيت هب
+    const bgImagePath = path.join(__dirname, 'background.jpg'); 
 
     if (!fs.existsSync(path.join(__dirname, 'uploads'))) {
         fs.mkdirSync(path.join(__dirname, 'uploads'));
@@ -49,10 +48,9 @@ app.post('/api/make-video', async (req, res) => {
     try {
         const firstAyahNum = parseInt(ayahs[0].numberInSurah || 1);
         
-        // حساب التوقيت بدقة للقطع أونلاين: الشيخ الشاطري متوسط الآية مع الوقف 6.4 ثانية
+        // حساب التوقيت بدقة للقطع أونلاين
         let startTimeSeconds = (firstAyahNum - 1) * 6.4; 
         
-        // ضبط مخصص لأول آيات سورة البقرة بسبب المدود الطويلة في البداية
         if (parseInt(surah_id) === 2) {
             if (firstAyahNum <= 5) startTimeSeconds = (firstAyahNum - 1) * 7.5;
             else if (firstAyahNum > 5 && firstAyahNum <= 15) startTimeSeconds = 35 + (firstAyahNum - 5) * 5.8;
@@ -67,7 +65,6 @@ app.post('/api/make-video', async (req, res) => {
             const start = index * durationPerAyah;
             const end = start + durationPerAyah;
             
-            // تنظيف الحروف تماماً عشان تظهر نظيفة وسليمة
             let cleanText = stripTashkeel(ayah.text);
             
             srtContent += `${index + 1}\n`;
@@ -75,7 +72,8 @@ app.post('/api/make-video', async (req, res) => {
             srtContent += `${cleanText}\n\n`;
         });
 
-        fs.writeFileSync(srtPath, '\ufeff' + srtContent, 'utf-8');
+        // حفظ بترميز UTF-8 نظيف بدون الـ BOM المعقد لـ Linux FFmpeg
+        fs.writeFileSync(srtPath, srtContent, 'utf-8');
 
         let command = ffmpeg().input(audioUrl);
         command.inputOptions([`-ss ${startTimeSeconds}`, `-t ${totalDuration}`]);
@@ -88,8 +86,8 @@ app.post('/api/make-video', async (req, res) => {
 
         command
             .complexFilter([
-                // الفلتر السليم لدمج النص على الصورة مباشرة بجودة Reels
-                `[1:v]scale=720:1280,subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,FontSize=18,Fontname=Arial,PrimaryColour=&HFFFFFF,Outline=2,OutlineColour=&H000000'[v]`
+                // شلنا شرط Fontname تماماً عشان السيرفر يختار الخط العربي الافتراضي بدون كراش
+                `[1:v]scale=720:1280,subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,FontSize=24,PrimaryColour=&HFFFFFF,Outline=2,OutlineColour=&H000000'[v]`
             ])
             .outputOptions([
                 '-map 0:a',          
