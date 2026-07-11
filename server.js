@@ -9,6 +9,14 @@ const upload = multer({ dest: 'uploads/' });
 
 app.use(express.json());
 
+// دالة مساعدة لتحويل الثواني لتنسيق ملفات الترجمة SRT (00:00:00,000)
+function formatSRTTime(seconds) {
+    const date = new Date(0);
+    date.setSeconds(seconds);
+    const timeString = date.toISOString().substr(11, 8);
+    return `${timeString},000`;
+}
+
 app.post('/api/make-video', upload.single('audio'), (req, res) => {
     const audioFile = req.file;
     const ayahsData = req.body.ayahs;
@@ -18,50 +26,62 @@ app.post('/api/make-video', upload.single('audio'), (req, res) => {
     }
 
     const ayahs = JSON.parse(ayahsData);
-    const outputPath = path.join(__dirname, 'uploads', `video_${Date.now()}.mp4`);
+    const timestamp = Date.now();
+    const srtPath = path.join(__dirname, 'uploads', `sub_${timestamp}.srt`);
+    const outputPath = path.join(__dirname, 'uploads', `video_${timestamp}.mp4`);
 
-    // هنا بنستخدم FFmpeg لتركيب النص فوق الصوت مع خلفية سوداء مخصصة للـ Reels
-    // سكريبت الـ Drawtext لتركيب نصوص الآيات ديناميكياً بناءً على التوقيت
-    let filterString = "color=s=1080x1920:c=0x111827[bg];";
-    
-    // حساب تقسيم الآيات بالتساوي بناءً على عددها كمثال مبدئي
-    // (تقدر تربطها بالـ timing الـ جاي من الـ API بدقة لاحقاً)
-    const durationPerAyah = 4; 
+    // 1. توليد ملف الترجمة تلقائياً بناءً على الآيات
+    let srtContent = '';
+    const durationPerAyah = 4; // مدة ظهور كل آية بالثواني
 
     ayahs.forEach((ayah, index) => {
         const start = index * durationPerAyah;
         const end = start + durationPerAyah;
-        // تنظيف النص من أي علامات قد تبوظ أمر الـ FFmpeg
-        const cleanText = ayah.text.replace(/'/g, "").replace(/"/g, "");
         
-        filterString += `[bg]drawtext=text='${cleanText}':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2:enable='between(t,${start},${end})'[bg];`;
+        srtContent += `${index + 1}\n`;
+        srtContent += `${formatSRTTime(start)} --> ${formatSRTTime(end)}\n`;
+        srtContent += `${ayah.text}\n\n`;
     });
 
-    // إزالة آخر سيميكولون وتسمية المخرج النهائي
-    filterString = filterString.slice(0, -1);
+    fs.writeFileSync(srtPath, srtContent, 'utf-8');
 
+    // 2. تشغيل الـ FFmpeg لتركيب الصوت والترجمة فوق الخلفية الداكنة
+    // تم تعديل الفلتر ليكون نقي ومستقر تماماً
     ffmpeg()
         .input(audioFile.path)
-        .inputOptions(['-f lavfi', '-i color=c=black:s=1080x1920']) // خلفية افتراضية لو الصوت طويل
-        .complexFilter(filterString)
-        .outputOptions(['-pix_fmt yuv420p', '-c:v libx264', '-c:a aac', '-shortest'])
+        .input('color=c=0x111827:s=1080x1920') // خلفية الـ Reels الداكنة
+        .inputOptions(['-f lavfi'])
+        .complexFilter([
+            `[1:v]subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,FontSize=24,Fontname=Arial,PrimaryColour=&HFFFFFF'[v]`
+        ])
+        .outputOptions([
+            '-map 0:a',          // أخذ الصوت من المدخل الأول
+            '-map [v]',          // أخذ الفيديو المضاف إليه النص
+            '-pix_fmt yuv420p',
+            '-c:v libx264',
+            '-c:a aac',
+            '-shortest'          // إنهاء الفيديو فور انتهاء صوت الآيات
+        ])
         .output(outputPath)
         .on('end', () => {
-            // مسح ملف الصوت المؤقت
-            fs.unlinkSync(audioFile.path);
+            // تنظيف الملفات المؤقتة من السيرفر فوراً
+            if (fs.existsSync(audioFile.path)) fs.unlinkSync(audioFile.path);
+            if (fs.existsSync(srtPath)) fs.unlinkSync(srtPath);
 
-            // إرسال الفيديو النهائي لـ n8n
+            // إرسال الـ MP4 النهائي لـ n8n
             res.download(outputPath, 'quran_reel.mp4', () => {
-                fs.unlinkSync(outputPath); // مسح الفيديو بعد التحميل لتنظيف السيرفر
+                if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
             });
         })
         .on('error', (err) => {
             console.error(err);
+            // تنظيف الملفات في حالة الفشل
+            if (fs.existsSync(audioFile.path)) fs.unlinkSync(audioFile.path);
+            if (fs.existsSync(srtPath)) fs.unlinkSync(srtPath);
             res.status(500).json({ success: false, error: err.message });
         })
         .run();
 });
 
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => console.log(`API running on port ${PORT}`));
