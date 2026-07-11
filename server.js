@@ -33,10 +33,14 @@ app.post('/api/make-video', async (req, res) => {
             startTimeSeconds = (firstAyahNum - 1) * 6.2; 
         }
 
-        // 1. تشغيل المتصفح الوهمي (خفيف جداً ومستقر)
+        // تحديد مسار الكروم اللي نزلناه إجبارياً لحل مشكلة السيرفر
+        const chromePath = path.join('/opt/render/.cache/puppeteer/chrome/linux-127.0.6533.88/chrome-linux/chrome');
+
+        // 1. تشغيل المتصفح الوهمي بالمسار الصحيح
         browser = await puppeteer.launch({
+            executablePath: fs.existsSync(chromePath) ? chromePath : undefined,
             headless: 'new',
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
         });
 
         const page = await browser.newPage();
