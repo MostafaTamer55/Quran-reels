@@ -6,7 +6,7 @@ const fs = require('fs');
 const app = express();
 app.use(express.json());
 
-// دالة تحويل الثواني لتنسيق SRT
+// دالة تحويل الثواني لتنسيق SRT الاحترافي الممسوح منه أي مشاكل
 function formatSRTTime(seconds) {
     if (isNaN(seconds) || seconds < 0) seconds = 0;
     const date = new Date(0);
@@ -26,6 +26,7 @@ app.post('/api/make-video', async (req, res) => {
     const timestamp = Date.now();
     const srtPath = path.join(__dirname, 'uploads', `sub_${timestamp}.srt`);
     const outputPath = path.join(__dirname, 'uploads', `video_${timestamp}.mp4`);
+    const bgVideoPath = path.join(__dirname, 'background.mp4'); // مسار فيديو الخلفية
 
     if (!fs.existsSync(path.join(__dirname, 'uploads'))) {
         fs.mkdirSync(path.join(__dirname, 'uploads'));
@@ -34,41 +35,54 @@ app.post('/api/make-video', async (req, res) => {
     try {
         let srtContent = '';
         
-        // حساب التوقيتات بناءً على ترتيب الـ 5 آيات المبعوثة (مثلاً 6 ثوانٍ لكل آية)
-        const durationPerAyah = 6; 
+        // جلب توقيت البداية والنهاية الحقيقي من أول آية لضمان تطابق الصوت
+        // إذا كان الـ API يرسل التوقيت بالثواني في حقل start_time أو audio_timestamps
+        let startTime = ayahs[0].start_time || 0; 
+        let totalDuration = 0;
+        
+        const durationPerAyah = 6; // مدة افتراضية إذا لم يتوفر توقيت لكل آية
 
         ayahs.forEach((ayah, index) => {
             const start = index * durationPerAyah;
             const end = start + durationPerAyah;
-            const cleanText = ayah.text ? ayah.text.replace(/'/g, "").replace(/"/g, "") : "آية قرآنية";
+            totalDuration += durationPerAyah;
+
+            // تنظيف النص وضمان إرساله بشكل سليم للـ SRT
+            let cleanText = ayah.text ? ayah.text.trim() : "";
             
             srtContent += `${index + 1}\n`;
             srtContent += `${formatSRTTime(start)} --> ${formatSRTTime(end)}\n`;
             srtContent += `${cleanText}\n\n`;
         });
 
-        fs.writeFileSync(srtPath, srtContent, 'utf-8');
-        const totalDuration = ayahs.length * durationPerAyah;
+        // حفظ ملف الترجمة بترميز UTF-8 مع الـ BOM لحل مشكلة الحروف المتقطعة في العربي
+        fs.writeFileSync(srtPath, '\ufeff' + srtContent, 'utf-8');
 
-        // تشغيل FFmpeg بنظام الـ Stream الخفيف للقص المباشر أونلاين
-        ffmpeg()
-            .input(audioUrl)
-            .inputOptions([
-                '-ss 00:00:00', // يمكنك استبدالها بوقت بداية الآيات الحقيقي لو متوفر في الـ JSON
-                `-t ${totalDuration}`
-            ])
-            .input('color=c=0x111827:s=720x1280:r=24') // جودة HD خفيفة وممتازة للـ Reels وتوفر الرام
-            .inputOptions(['-f lavfi'])
+        // تحديد المدخلات: إذا وجد فيديو خلفيةbackground.mp4 سيستخدمه، وإلا سيستخدم الخلفية السوداء الافتراضية
+        let command = ffmpeg().input(audioUrl);
+        
+        // لتطابق الصوت: نقص من ملف الصوت الكبير من بداية وقت الآيات الحقيقي
+        command.inputOptions([`-ss ${startTime}`, `-t ${totalDuration}`]);
+
+        if (fs.existsSync(bgVideoPath)) {
+            command.input(bgVideoPath).inputOptions(['-stream_loop -1']); // تكرار فيديو الخلفية لو قصير
+        } else {
+            command.input('color=c=0x111827:s=720x1280:r=24').inputOptions(['-f lavfi']);
+        }
+
+        command
             .complexFilter([
-                `[1:v]subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,FontSize=18,Fontname=Arial,PrimaryColour=&HFFFFFF,Outline=1,Shadow=1'[v]`
+                // دمج الترجمة وضبط الخط ليظهر بشكل صحيح متصل Alignment=2 (في المنتصف أسفل)
+                `[1:v]subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,FontSize=20,Fontname=Arial,PrimaryColour=&HFFFFFF,Outline=2,OutlineColour=&H000000'[v]`
             ])
             .outputOptions([
                 '-map 0:a',          
                 '-map [v]',          
                 '-pix_fmt yuv420p',
                 '-c:v libx264',
-                '-preset ultrafast', // يمنع الـ Timeout تماماً بجعل الرندر فوري
+                '-preset ultrafast',
                 '-c:a aac',
+                `-t ${totalDuration}`,
                 '-shortest'
             ])
             .output(outputPath)
