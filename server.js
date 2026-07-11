@@ -6,6 +6,7 @@ const fs = require('fs');
 const app = express();
 app.use(express.json());
 
+// دالة تحويل الثواني لتنسيق SRT
 function formatSRTTime(seconds) {
     if (isNaN(seconds) || seconds < 0) seconds = 0;
     const date = new Date(0);
@@ -13,6 +14,17 @@ function formatSRTTime(seconds) {
     const timeString = date.toISOString().substr(11, 8);
     const ms = Math.floor((seconds % 1) * 1000).toString().padStart(3, '0');
     return `${timeString},${ms}`;
+}
+
+// دالة سحرية لتنظيف النص من علامات الوقف العثمانية التي تسبب ظهور المربعات []
+function cleanArabicText(text) {
+    if (!text) return "آية قرآنية";
+    return text
+        .replace(/[\u0610-\u0615]/g, '') // علامات الضبط والوقف الصغيرة
+        .replace(/[\u06D6-\u06ED]/g, '') // علامات وقف المصحف (ج، قلى، صلى، م، لا)
+        .replace(/'/g, "")
+        .replace(/"/g, "")
+        .trim();
 }
 
 app.post('/api/make-video', async (req, res) => {
@@ -25,8 +37,6 @@ app.post('/api/make-video', async (req, res) => {
     const timestamp = Date.now();
     const srtPath = path.join(__dirname, 'uploads', `sub_${timestamp}.srt`);
     const outputPath = path.join(__dirname, 'uploads', `video_${timestamp}.mp4`);
-    
-    // مسار صورة الخلفية
     const bgImagePath = path.join(__dirname, 'background.png'); 
 
     if (!fs.existsSync(path.join(__dirname, 'uploads'))) {
@@ -35,16 +45,29 @@ app.post('/api/make-video', async (req, res) => {
 
     try {
         let srtContent = '';
-        let startTime = ayahs[0].start_time || 0; 
+        
+        // محاولة جلب التوقيت الحقيقي للآية الأولى من الـ الـ API لضبط تطابق الصوت
+        // الـ API في موقع quran2reels بيبعت التوقيت في حقل "seconds" أو "start_time" داخل الـ JSON
+        let startTimeSeconds = 0;
+        
+        if (ayahs[0] && (ayahs[0].start_time !== undefined || ayahs[0].seconds !== undefined)) {
+            startTimeSeconds = ayahs[0].start_time || ayahs[0].seconds;
+        } else {
+            // كحل بديل إذا لم يتوفر التوقيت: حساب تقريبي بناءً على رقم الآية الحالية (الآية * متوسط 5 ثوانٍ)
+            const fromAyah = ayahs[0].numberInSurah || 1;
+            startTimeSeconds = (fromAyah - 1) * 6; 
+        }
+
+        const durationPerAyah = 6; // مدة ظهور كل آية
         let totalDuration = 0;
-        const durationPerAyah = 6; 
 
         ayahs.forEach((ayah, index) => {
             const start = index * durationPerAyah;
             const end = start + durationPerAyah;
             totalDuration += durationPerAyah;
 
-            let cleanText = ayah.text ? ayah.text.trim() : "";
+            // تنظيف النص فوراً قبل كتابته في ملف الترجمة
+            let cleanText = cleanArabicText(ayah.text);
             
             srtContent += `${index + 1}\n`;
             srtContent += `${formatSRTTime(start)} --> ${formatSRTTime(end)}\n`;
@@ -54,19 +77,18 @@ app.post('/api/make-video', async (req, res) => {
         fs.writeFileSync(srtPath, '\ufeff' + srtContent, 'utf-8');
 
         let command = ffmpeg().input(audioUrl);
-        command.inputOptions([`-ss ${startTime}`, `-t ${totalDuration}`]);
+        
+        // هنا السر! نقص من ملف الصوت الكبير بناءً على وقت بداية الآيات الحقيقي
+        command.inputOptions([`-ss ${startTimeSeconds}`, `-t ${totalDuration}`]);
 
-        // التحقق من وجود الصورة وتحويلها لفيديو ثابت ممتد
         if (fs.existsSync(bgImagePath)) {
-            command.input(bgImagePath)
-                   .inputOptions(['-loop 1', `-t ${totalDuration}`]); // عمل Loop للصورة على قد مدة الصوت
+            command.input(bgImagePath).inputOptions(['-loop 1', `-t ${totalDuration}`]);
         } else {
             command.input('color=c=0x111827:s=1080x1920:r=25').inputOptions(['-f lavfi', `-t ${totalDuration}`]);
         }
 
         command
             .complexFilter([
-                // دمج الترجمة وضبط الخط ليظهر متصلاً واحترافياً باللغة العربية
                 `[1:v]subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,FontSize=22,Fontname=Arial,PrimaryColour=&HFFFFFF,Outline=2,OutlineColour=&H000000'[v]`
             ])
             .outputOptions([
