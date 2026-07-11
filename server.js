@@ -6,24 +6,40 @@ const fs = require('fs');
 const app = express();
 app.use(express.json());
 
-// دالة تنظيف النص تماماً من التشكيل العثماني عشان يظهر سادة وواضح لمنع المربعات []
+function formatSRTTime(seconds) {
+    if (isNaN(seconds) || seconds < 0) seconds = 0;
+    const date = new Date(0);
+    date.setSeconds(seconds);
+    const timeString = date.toISOString().substr(11, 8);
+    const ms = Math.floor((seconds % 1) * 1000).toString().padStart(3, '0');
+    return `${timeString},${ms}`;
+}
+
 function stripTashkeel(text) {
     if (!text) return "آية قرآنية";
     return text
-        .replace(/[\u064B-\u065F]/g, "") // حذف التشكيل (فتحة، ضمة، كسرة، سكون)
-        .replace(/[\u0610-\u0615]/g, "") // حذف علامات الضبط
-        .replace(/[\u06D6-\u06ED]/g, "") // حذف علامات الوقف (ج، صلى، قلى)
-        .replace(/ٰ/g, "")               // حذف الألف الخنجرية
-        .replace(/[^\u0600-\u06FF\s]/g, "") // حذف أي رموز غريبة
+        .replace(/[\u064B-\u065F]/g, "") 
+        .replace(/[\u0610-\u0615]/g, "") 
+        .replace(/[\u06D6-\u06ED]/g, "") 
+        .replace(/ٰ/g, "")               
+        .replace(/[^\u0600-\u06FF\s]/g, "") 
         .replace(/\s+/g, " ")
         .trim();
 }
 
 app.post('/api/make-video', async (req, res) => {
-    const { audioUrl, ayahs, surah_id } = req.body;
+    let { audioUrl, ayahs, surah_id } = req.body;
 
-    if (!audioUrl || !ayahs || ayahs.length === 0) {
-        return res.status(400).json({ success: false, message: 'Missing required parameters' });
+    // تنظيف وتنقية رابط الصوت لو جاي بالخطأ كـ مصفوفة أو نص معقد من n8n
+    if (Array.isArray(audioUrl)) {
+        audioUrl = audioUrl[0];
+    }
+    if (typeof audioUrl === 'string') {
+        audioUrl = audioUrl.replace(/[\[\]]/g, '').trim();
+    }
+
+    if (!audioUrl || !audioUrl.startsWith('http') || !ayahs || ayahs.length === 0) {
+        return res.status(400).json({ success: false, message: 'Invalid or missing parameters', receivedUrl: audioUrl });
     }
 
     const timestamp = Date.now();
@@ -36,7 +52,6 @@ app.post('/api/make-video', async (req, res) => {
     try {
         const firstAyahNum = parseInt(ayahs[0].numberInSurah || 1);
         
-        // حساب التوقيت بدقة لقطع صوت الشاطري من مكانه الصح
         let startTimeSeconds = (firstAyahNum - 1) * 6.4; 
         if (parseInt(surah_id) === 2) {
             if (firstAyahNum <= 5) startTimeSeconds = (firstAyahNum - 1) * 7.5;
@@ -47,9 +62,11 @@ app.post('/api/make-video', async (req, res) => {
         const durationPerAyah = 6; 
         const totalDuration = ayahs.length * durationPerAyah;
 
-        // تجهيز الفلاتر النصية لكل آية بناءً على وقت ظهورها أوتوماتيك
+        // تحديد مسار خط النظام الافتراضي في سيرفرات الـ Linux لضمان القراءة
+        const fontPath = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
+        const fontSetting = fs.existsSync(fontPath) ? `:fontfile=${fontPath}` : '';
+
         let filters = [];
-        // 1. إنشاء الخلفية الداكنة الثابتة بالـ أبعاد الصحيحة للـ Reels
         filters.push(`color=c=0x111827:s=720x1280:r=25:d=${totalDuration}[bg]`);
 
         let currentInput = '[bg]';
@@ -60,15 +77,13 @@ app.post('/api/make-video', async (req, res) => {
             const cleanText = stripTashkeel(ayah.text);
             const outputLabel = `v${index}`;
 
-            // استخدام drawtext لرسم النص العربي مباشرة بدون الاحتياج لملف SRT أو كراش الخطوط
             filters.push(
-                `${currentInput}drawtext=text='${cleanText}':fontcolor=white:fontsize=28:x=(w-text_w)/2:y=(h-text_h)/2:enable='between(t,${start},${end})'[${outputLabel}]`
+                `${currentInput}drawtext=text='${cleanText}':fontcolor=white:fontsize=24:x=(w-text_w)/2:y=(h-text_h)/2${fontSetting}:enable='between(t,${start},${end})'[${outputLabel}]`
             );
             currentInput = `[${outputLabel}]`;
         });
 
         let command = ffmpeg().input(audioUrl);
-        // تقطيع الصوت من التوقيت المناسب للآيات
         command.inputOptions([`-ss ${startTimeSeconds}`, `-t ${totalDuration}`]);
 
         command
