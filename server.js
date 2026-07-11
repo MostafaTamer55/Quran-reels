@@ -2,6 +2,7 @@ const express = require('express');
 const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs');
+const axios = require('axios'); // للتواصل السريع مع الـ API الخارجي
 
 const app = express();
 app.use(express.json());
@@ -16,22 +17,23 @@ function formatSRTTime(seconds) {
     return `${timeString},${ms}`;
 }
 
-// دالة سحرية لتنظيف النص من علامات الوقف العثمانية التي تسبب ظهور المربعات []
+// دالة تنظيف النص من علامات الوقف والمربعات الغريبة []
 function cleanArabicText(text) {
     if (!text) return "آية قرآنية";
     return text
         .replace(/[\u0610-\u0615]/g, '') // علامات الضبط والوقف الصغيرة
-        .replace(/[\u06D6-\u06ED]/g, '') // علامات وقف المصحف (ج، قلى، صلى، م، لا)
+        .replace(/[\u06D6-\u06ED]/g, '') // علامات وقف المصحف بالكامل
         .replace(/'/g, "")
         .replace(/"/g, "")
+        .replace(/ۛ/g, "")
         .trim();
 }
 
 app.post('/api/make-video', async (req, res) => {
-    const { audioUrl, ayahs } = req.body;
+    const { audioUrl, ayahs, surah_id } = req.body;
 
-    if (!audioUrl || !ayahs) {
-        return res.status(400).json({ success: false, message: 'Missing audioUrl or ayahs data' });
+    if (!audioUrl || !ayahs || ayahs.length === 0) {
+        return res.status(400).json({ success: false, message: 'Missing required parameters' });
     }
 
     const timestamp = Date.now();
@@ -44,29 +46,35 @@ app.post('/api/make-video', async (req, res) => {
     }
 
     try {
-        let srtContent = '';
-        
-        // محاولة جلب التوقيت الحقيقي للآية الأولى من الـ الـ API لضبط تطابق الصوت
-        // الـ API في موقع quran2reels بيبعت التوقيت في حقل "seconds" أو "start_time" داخل الـ JSON
+        const surahNumber = surah_id || 2; // رقم السورة الافتراضي
+        const firstAyahNum = ayahs[0].numberInSurah;
+        const lastAyahNum = ayahs[ayahs.length - 1].numberInSurah;
+
         let startTimeSeconds = 0;
-        
-        if (ayahs[0] && (ayahs[0].start_time !== undefined || ayahs[0].seconds !== undefined)) {
-            startTimeSeconds = ayahs[0].start_time || ayahs[0].seconds;
-        } else {
-            // كحل بديل إذا لم يتوفر التوقيت: حساب تقريبي بناءً على رقم الآية الحالية (الآية * متوسط 5 ثوانٍ)
-            const fromAyah = ayahs[0].numberInSurah || 1;
-            startTimeSeconds = (fromAyah - 1) * 6; 
+        let totalDuration = ayahs.length * 6; // افتراضي 6 ثواني لكل آية في حالة الفشل
+
+        try {
+            // جلب التوقيت الدقيق جداً لأبو بكر الشاطري أونلاين بناءً على السورة
+            const timingResponse = await axios.get(`https://api.quran.com/api/v4/recitations/7/by_ayah/${surahNumber}:${firstAyahNum}`);
+            if (timingResponse.data && timingResponse.data.audio_files && timingResponse.data.audio_files[0]) {
+                const audioFile = timingResponse.data.audio_files[0];
+                // حساب وقت البداية من حقل الـ segments الحقيقي بالملي ثانية
+                if (audioFile.segments && audioFile.segments[0]) {
+                    startTimeSeconds = audioFile.segments[0][1] / 1000; // تحويل لثواني
+                }
+            }
+        } catch (err) {
+            console.log("Timing API failed, using backup calculation.");
+            startTimeSeconds = (firstAyahNum - 1) * 5.8; // حساب تقريبي ذكي جداً
         }
 
-        const durationPerAyah = 6; // مدة ظهور كل آية
-        let totalDuration = 0;
+        let srtContent = '';
+        const durationPerAyah = 6; 
 
         ayahs.forEach((ayah, index) => {
             const start = index * durationPerAyah;
             const end = start + durationPerAyah;
-            totalDuration += durationPerAyah;
-
-            // تنظيف النص فوراً قبل كتابته في ملف الترجمة
+            
             let cleanText = cleanArabicText(ayah.text);
             
             srtContent += `${index + 1}\n`;
@@ -74,11 +82,12 @@ app.post('/api/make-video', async (req, res) => {
             srtContent += `${cleanText}\n\n`;
         });
 
+        // حفظ بترميز UTF-8 مع الـ BOM لمنع الحروف المتقطعة نهائياً في FFmpeg
         fs.writeFileSync(srtPath, '\ufeff' + srtContent, 'utf-8');
 
         let command = ffmpeg().input(audioUrl);
         
-        // هنا السر! نقص من ملف الصوت الكبير بناءً على وقت بداية الآيات الحقيقي
+        // التقطيع من مكان الآيات الحقيقي بالظبط
         command.inputOptions([`-ss ${startTimeSeconds}`, `-t ${totalDuration}`]);
 
         if (fs.existsSync(bgImagePath)) {
@@ -89,6 +98,7 @@ app.post('/api/make-video', async (req, res) => {
 
         command
             .complexFilter([
+                // دمج الترجمة وحل مشكلة الخطوط والمربعات
                 `[1:v]subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,FontSize=22,Fontname=Arial,PrimaryColour=&HFFFFFF,Outline=2,OutlineColour=&H000000'[v]`
             ])
             .outputOptions([
