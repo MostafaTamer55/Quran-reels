@@ -16,15 +16,17 @@ function formatSRTTime(seconds) {
     return `${timeString},${ms}`;
 }
 
-// دالة سحرية لتنظيف النص من علامات الوقف والمربعات الغريبة []
-function cleanArabicText(text) {
+// دالة قوية جداً لتنظيف النص تماماً من أي تشكيل أو رموز مصحفية تسبب المربعات []
+function removeAllTashkeel(text) {
     if (!text) return "آية قرآنية";
     return text
-        .replace(/[\u0610-\u0615]/g, '') // علامات الضبط والوقف الصغيرة
-        .replace(/[\u06D6-\u06ED]/g, '') // علامات وقف المصحف بالكامل
-        .replace(/'/g, "")
-        .replace(/"/g, "")
-        .replace(/ۛ/g, "")
+        .replace(/[\u064B-\u065F]/g, "") // حذف التشكيل العادي (فتحة، ضمة، كسرة، سكون...)
+        .replace(/[\u0610-\u0615]/g, "") // حذف علامات الضبط
+        .replace(/[\u06D6-\u06ED]/g, "") // حذف علامات الوقف المصحفية (ج، صلى، قلى...)
+        .replace(/إ/g, "ا").replace(/أ/g, "ا").replace(/آ/g, "ا") // توحيد الألفات لمنع تشتت الخط
+        .replace(/ٰ/g, "") // حذف الألف الخنجرية
+        .replace(/[^\u0600-\u06FF\s]/g, "") // حذف أي رمز ليس حرفاً عربياً أو مسافة
+        .replace(/\s+/g, " ")
         .trim();
 }
 
@@ -38,44 +40,39 @@ app.post('/api/make-video', async (req, res) => {
     const timestamp = Date.now();
     const srtPath = path.join(__dirname, 'uploads', `sub_${timestamp}.srt`);
     const outputPath = path.join(__dirname, 'uploads', `video_${timestamp}.mp4`);
-    const bgImagePath = path.join(__dirname, 'background.png'); 
+    
+    // البحث عن الخلفية بكافة الامتدادات الممكنة لضمان القراءة
+    let bgImagePath = path.join(__dirname, 'background.jpg');
+    if (!fs.existsSync(bgImagePath)) {
+        bgImagePath = path.join(__dirname, 'background.png');
+    }
 
     if (!fs.existsSync(path.join(__dirname, 'uploads'))) {
         fs.mkdirSync(path.join(__dirname, 'uploads'));
     }
 
     try {
-        const surahNumber = surah_id || 2; 
-        const firstAyahNum = ayahs[0].numberInSurah;
-
-        let startTimeSeconds = 0;
-        let totalDuration = ayahs.length * 6; // افتراضي 6 ثواني لكل آية في حالة الفشل
-
-        try {
-            // جلب التوقيت الدقيق جداً لأبو بكر الشاطري باستخدام fetch المدمج
-            const response = await fetch(`https://api.quran.com/api/v4/recitations/7/by_ayah/${surahNumber}:${firstAyahNum}`);
-            if (response.ok) {
-                const data = await response.json();
-                if (data && data.audio_files && data.audio_files[0]) {
-                    const audioFile = data.audio_files[0];
-                    if (audioFile.segments && audioFile.segments[0]) {
-                        startTimeSeconds = audioFile.segments[0][1] / 1000; // تحويل لثواني
-                    }
-                }
-            }
-        } catch (err) {
-            console.log("Timing API failed, using backup calculation.");
-            startTimeSeconds = (firstAyahNum - 1) * 5.8; // حساب تقريبي ذكي جداً
+        const firstAyahNum = parseInt(ayahs[0].numberInSurah || 1);
+        
+        // حساب توقيت البداية ديناميكياً: متوسط الشيخ الشاطري في الآية هو 5.5 ثوانٍ
+        // لو واصلين للآية 21 مثلاً، يبدأ القطع من الثانية (20 * 5.5) = 110 ثانية جوه السورة
+        let startTimeSeconds = (firstAyahNum - 1) * 5.5; 
+        
+        // تعديل يدوي ذكي للبقرة لو الآيات متأخرة
+        if (parseInt(surah_id) === 2 && firstAyahNum > 10) {
+            startTimeSeconds = (firstAyahNum - 1) * 6.2; 
         }
 
-        let srtContent = '';
-        const durationPerAyah = 6; 
+        const durationPerAyah = 6; // مدة بقاء النص
+        const totalDuration = ayahs.length * durationPerAyah;
 
+        let srtContent = '';
         ayahs.forEach((ayah, index) => {
             const start = index * durationPerAyah;
             const end = start + durationPerAyah;
             
-            let cleanText = cleanArabicText(ayah.text);
+            // تنظيف كامل للنص ليكون حروفاً واضحة بدون مربعات
+            let cleanText = removeAllTashkeel(ayah.text);
             
             srtContent += `${index + 1}\n`;
             srtContent += `${formatSRTTime(start)} --> ${formatSRTTime(end)}\n`;
@@ -87,15 +84,19 @@ app.post('/api/make-video', async (req, res) => {
         let command = ffmpeg().input(audioUrl);
         command.inputOptions([`-ss ${startTimeSeconds}`, `-t ${totalDuration}`]);
 
+        // إجبار تشغيل الصورة
         if (fs.existsSync(bgImagePath)) {
+            console.log("Background image found:", bgImagePath);
             command.input(bgImagePath).inputOptions(['-loop 1', `-t ${totalDuration}`]);
         } else {
-            command.input('color=c=0x111827:s=1080x1920:r=25').inputOptions(['-f lavfi', `-t ${totalDuration}`]);
+            console.log("No background found, using solid color.");
+            command.input('color=c=0x111827:s=720x1280:r=15').inputOptions(['-f lavfi', `-t ${totalDuration}`]);
         }
 
         command
             .complexFilter([
-                `[1:v]subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,FontSize=22,Fontname=Arial,PrimaryColour=&HFFFFFF,Outline=2,OutlineColour=&H000000'[v]`
+                // دمج الفلتر مع إجبار الفريمات والأبعاد المتوافقة مع الرام والصورة
+                `[1:v]scale=720:1280,subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,FontSize=20,Fontname=Arial,PrimaryColour=&HFFFFFF,Outline=2,OutlineColour=&H000000'[v]`
             ])
             .outputOptions([
                 '-map 0:a',          
