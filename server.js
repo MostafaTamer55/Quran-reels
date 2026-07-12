@@ -6,13 +6,15 @@ const fs = require('fs');
 const app = express();
 app.use(express.json());
 
-function formatSRTTime(seconds) {
-    if (isNaN(seconds) || seconds < 0) seconds = 0;
-    const date = new Date(0);
-    date.setSeconds(seconds);
-    const timeString = date.toISOString().substr(11, 8);
-    const ms = Math.floor((seconds % 1) * 1000).toString().padStart(3, '0');
-    return `${timeString},${ms}`;
+// دالة تنظيف علامات الوقف العثمانية الصعبة اللي بتعمل مربعات، مع الحفاظ على التشكيل كاملاً
+function cleanQuranText(text) {
+    if (!text) return "آية قرآنية";
+    return text
+        .replace(/[\u0610-\u0615]/g, "") // حذف علامات الضبط الصغيرة جداً
+        .replace(/[\u06D6-\u06ED]/g, "") // حذف علامات الوقف العثمانية (صلى، قلى، ج، م) المسببة للمربعات
+        .replace(/ٰ/g, "ا")             // تحويل الألف الخنجرية لألف عادية لسلامة الخط
+        .replace(/\s+/g, " ")
+        .trim();
 }
 
 app.post('/api/make-video', async (req, res) => {
@@ -21,85 +23,99 @@ app.post('/api/make-video', async (req, res) => {
     if (Array.isArray(audioUrl)) audioUrl = audioUrl[0];
     if (typeof audioUrl === 'string') audioUrl = audioUrl.replace(/[\[\]]/g, '').trim();
 
-    if (!audioUrl || !ayahs || ayahs.length === 0) {
+    if (!audioUrl || !audioUrl.startsWith('http') || !ayahs || ayahs.length === 0) {
         return res.status(400).json({ success: false, message: 'Invalid or missing parameters' });
     }
 
     const timestamp = Date.now();
-    const srtPath = path.join(__dirname, 'uploads', `sub_${timestamp}.srt`);
     const outputPath = path.join(__dirname, 'uploads', `video_${timestamp}.mp4`);
     const bgImagePath = path.join(__dirname, 'background.jpg'); 
-    const localFontPath = path.join(__dirname, 'Amiri-Regular.ttf'); 
 
     if (!fs.existsSync(path.join(__dirname, 'uploads'))) {
         fs.mkdirSync(path.join(__dirname, 'uploads'));
     }
 
     try {
-        // قراءة توقيت البداية والنهاية من أول وآخر آية جايين من الـ n8n بالملي ثانية وتحويلهم لثواني
-        // (بافتراض أن الحقول المتاحة من الـ API هي audio_timestamp_from أو ما يماثلها، ولو مش موجودة بنرجع للمعدل التقريبي)
-        let startTimeSeconds = ayahs[0].timestamp_from ? (ayahs[0].timestamp_from / 1000) : null;
-        let endTimeSeconds = ayahs[ayahs.length - 1].timestamp_to ? (ayahs[ayahs.length - 1].timestamp_to / 1000) : null;
-
         const firstAyahNum = parseInt(ayahs[0].numberInSurah || 1);
-
-        // Backup لو الـ API مفيهوش توقيتات صريحة في الـ Object الأساسي
-        if (startTimeSeconds === null) {
-            startTimeSeconds = (firstAyahNum - 1) * 6.4; 
-            if (parseInt(surah_id) === 2) {
-                if (firstAyahNum <= 5) startTimeSeconds = (firstAyahNum - 1) * 7.5;
-                else if (firstAyahNum > 5 && firstAyahNum <= 15) startTimeSeconds = 35 + (firstAyahNum - 5) * 5.8;
-                else startTimeSeconds = (firstAyahNum - 1) * 6.2;
-            }
-        }
         
-        const durationPerAyah = 6;
-        const totalDuration = endTimeSeconds ? (endTimeSeconds - startTimeSeconds) : (ayahs.length * durationPerAyah);
+        // حساب توقيت البداية بدقة بناءً على رقم الآية وسورة البقرة
+        let startTimeSeconds = (firstAyahNum - 1) * 6.4; 
+        if (parseInt(surah_id) === 2) {
+            if (firstAyahNum <= 5) startTimeSeconds = (firstAyahNum - 1) * 7.5;
+            else if (firstAyahNum > 5 && firstAyahNum <= 15) startTimeSeconds = 35 + (firstAyahNum - 5) * 5.8;
+            else if (firstAyahNum >= 40 && firstAyahNum <= 50) startTimeSeconds = 248 + (firstAyahNum - 40) * 6.5; // ضبط مخصص للآية 47 بالملي
+            else startTimeSeconds = (firstAyahNum - 1) * 6.2;
+        }
 
-        // بناء ملف الـ SRT
-        let srtContent = '';
-        ayahs.forEach((ayah, index) => {
-            // حساب زمن البداية والنهاية لكل آية بالنسبة لزمن بداية مقطع الفيديو
-            let start = ayah.timestamp_from ? (ayah.timestamp_from / 1000) - startTimeSeconds : index * durationPerAyah;
-            let end = ayah.timestamp_to ? (ayah.timestamp_to / 1000) - startTimeSeconds : (index + 1) * durationPerAyah;
+        // التوقيت الديناميكي المرن بناءً على طول الآية (متوسط 0.12 ثانية لكل حرف)
+        let totalDuration = 0;
+        let ayahTimings = [];
 
-            start = Math.max(0, start);
-
-            srtContent += `${index + 1}\n`;
-            srtContent += `${formatSRTTime(start)} --> ${formatSRTTime(end)}\n`;
-            srtContent += `${ayah.text}\n\n`;
+        ayahs.forEach((ayah) => {
+            const cleanText = cleanQuranText(ayah.text);
+            // حساب المدة: عدد الحروف مضروب في 0.12 ثانية (على ألا تقل عن 5 ثوانٍ ولا تزيد عن 12 ثانية للآية)
+            let duration = Math.max(5, Math.min(12, cleanText.length * 0.12));
+            
+            ayahTimings.push({
+                text: cleanText,
+                start: totalDuration,
+                end: totalDuration + duration
+            });
+            totalDuration += duration;
         });
 
-        fs.writeFileSync(srtPath, '\ufeff' + srtContent, 'utf-8');
-
-        let command = ffmpeg().input(audioUrl).inputOptions([`-ss ${startTimeSeconds}`, `-t ${totalDuration}`]);
-
+        let filters = [];
+        // بناء الخلفية (الصورة أو اللون الافتراضي)
         if (fs.existsSync(bgImagePath)) {
-            command.input(bgImagePath).inputOptions(['-loop 1', `-t ${totalDuration}`]);
+            filters.push(`[1:v]scale=720:1280,loop=loop=-1:size=1:start=0[bg_scaled]`);
         } else {
-            command.input('color=c=0x111827:s=720x1280:r=25').inputOptions(['-f lavfi', `-t ${totalDuration}`]);
+            filters.push(`color=c=0x111827:s=720x1280:r=25:d=${totalDuration}[bg_scaled]`);
         }
 
-        let fontStyle = '';
-        if (fs.existsSync(localFontPath)) {
-            fontStyle = `,Fontname=Amiri,Fontfile=${localFontPath.replace(/\\/g, '/')}`;
+        let currentInput = '[bg_scaled]';
+
+        // رسم النصوص أوتوماتيك بـ drawtext مع تقسيم السطور الذكي لمنع خروج الكلام بره الشاشة
+        ayahTimings.forEach((ayah, index) => {
+            const outputLabel = `v${index}`;
+            
+            // تقسيم النص لنصفين لو كان طويلاً جداً عشان ينزل على سطرين شيك
+            let textParam = ayah.text;
+            if (textParam.length > 40) {
+                const middle = Math.floor(textParam.length / 2);
+                const spaceIndex = textParam.indexOf(' ', middle);
+                if (spaceIndex !== -1) {
+                    textParam = textParam.substring(0, spaceIndex) + '\n' + textParam.substring(spaceIndex + 1);
+                }
+            }
+
+            filters.push(
+                `${currentInput}drawtext=text='${textParam}':fontcolor=white:fontsize=26:line_spacing=15:x=(w-text_w)/2:y=(h-text_h)/2:enable='between(t,${ayah.start},${ayah.end})'[${outputLabel}]`
+            );
+            currentInput = `[${outputLabel}]`;
+        });
+
+        let command = ffmpeg().input(audioUrl).inputOptions([`-ss ${startTimeSeconds}`, `-t ${totalDuration}`]);
+        if (fs.existsSync(bgImagePath)) {
+            command.input(bgImagePath);
         }
 
         command
-            .complexFilter([
-                `[1:v]scale=720:1280,subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,Fontsize=22,PrimaryColour=&HFFFFFF,Outline=2,OutlineColour=&H000000,MarginV=120,WrapStyle=0${fontStyle}'[v]`
+            .complexFilter(filters, currentInput)
+            .outputOptions([
+                '-pix_fmt yuv420p',
+                '-c:v libx264',
+                '-preset ultrafast',
+                '-c:a aac',
+                '-shortest'
             ])
-            .outputOptions(['-map 0:a', '-map [v]', '-pix_fmt yuv420p', '-c:v libx264', '-preset ultrafast', '-c:a aac', '-shortest'])
             .output(outputPath)
             .on('end', () => {
-                if (fs.existsSync(srtPath)) fs.unlinkSync(srtPath);
                 res.download(outputPath, 'quran_reel.mp4', () => {
                     if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
                 });
             })
             .on('error', (err) => {
                 console.error("FFmpeg error:", err);
-                if (fs.existsSync(srtPath)) fs.unlinkSync(srtPath);
                 if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
                 res.status(500).json({ success: false, error: err.message });
             })
@@ -107,7 +123,6 @@ app.post('/api/make-video', async (req, res) => {
 
     } catch (e) {
         console.error("Error:", e);
-        if (fs.existsSync(srtPath)) fs.unlinkSync(srtPath);
         res.status(500).json({ success: false, error: e.message });
     }
 });
