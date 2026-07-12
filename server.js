@@ -21,7 +21,7 @@ app.post('/api/make-video', async (req, res) => {
     if (Array.isArray(audioUrl)) audioUrl = audioUrl[0];
     if (typeof audioUrl === 'string') audioUrl = audioUrl.replace(/[\[\]]/g, '').trim();
 
-    if (!audioUrl || !audioUrl.startsWith('http') || !ayahs || ayahs.length === 0) {
+    if (!audioUrl || !ayahs || ayahs.length === 0) {
         return res.status(400).json({ success: false, message: 'Invalid or missing parameters' });
     }
 
@@ -36,23 +36,38 @@ app.post('/api/make-video', async (req, res) => {
     }
 
     try {
+        // قراءة توقيت البداية والنهاية من أول وآخر آية جايين من الـ n8n بالملي ثانية وتحويلهم لثواني
+        // (بافتراض أن الحقول المتاحة من الـ API هي audio_timestamp_from أو ما يماثلها، ولو مش موجودة بنرجع للمعدل التقريبي)
+        let startTimeSeconds = ayahs[0].timestamp_from ? (ayahs[0].timestamp_from / 1000) : null;
+        let endTimeSeconds = ayahs[ayahs.length - 1].timestamp_to ? (ayahs[ayahs.length - 1].timestamp_to / 1000) : null;
+
         const firstAyahNum = parseInt(ayahs[0].numberInSurah || 1);
-        
-        let startTimeSeconds = (firstAyahNum - 1) * 6.4; 
-        if (parseInt(surah_id) === 2) {
-            if (firstAyahNum <= 5) startTimeSeconds = (firstAyahNum - 1) * 7.5;
-            else if (firstAyahNum > 5 && firstAyahNum <= 15) startTimeSeconds = 35 + (firstAyahNum - 5) * 5.8;
-            else startTimeSeconds = (firstAyahNum - 1) * 6.2;
+
+        // Backup لو الـ API مفيهوش توقيتات صريحة في الـ Object الأساسي
+        if (startTimeSeconds === null) {
+            startTimeSeconds = (firstAyahNum - 1) * 6.4; 
+            if (parseInt(surah_id) === 2) {
+                if (firstAyahNum <= 5) startTimeSeconds = (firstAyahNum - 1) * 7.5;
+                else if (firstAyahNum > 5 && firstAyahNum <= 15) startTimeSeconds = 35 + (firstAyahNum - 5) * 5.8;
+                else startTimeSeconds = (firstAyahNum - 1) * 6.2;
+            }
         }
+        
+        const durationPerAyah = 6;
+        const totalDuration = endTimeSeconds ? (endTimeSeconds - startTimeSeconds) : (ayahs.length * durationPerAyah);
 
-        const durationPerAyah = 6; 
-        const totalDuration = ayahs.length * durationPerAyah;
-
+        // بناء ملف الـ SRT
         let srtContent = '';
         ayahs.forEach((ayah, index) => {
-            const start = index * durationPerAyah;
-            const end = start + durationPerAyah;
-            srtContent += `${index + 1}\n${formatSRTTime(start)} --> ${formatSRTTime(end)}\n${ayah.text}\n\n`;
+            // حساب زمن البداية والنهاية لكل آية بالنسبة لزمن بداية مقطع الفيديو
+            let start = ayah.timestamp_from ? (ayah.timestamp_from / 1000) - startTimeSeconds : index * durationPerAyah;
+            let end = ayah.timestamp_to ? (ayah.timestamp_to / 1000) - startTimeSeconds : (index + 1) * durationPerAyah;
+
+            start = Math.max(0, start);
+
+            srtContent += `${index + 1}\n`;
+            srtContent += `${formatSRTTime(start)} --> ${formatSRTTime(end)}\n`;
+            srtContent += `${ayah.text}\n\n`;
         });
 
         fs.writeFileSync(srtPath, '\ufeff' + srtContent, 'utf-8');
@@ -65,7 +80,6 @@ app.post('/api/make-video', async (req, res) => {
             command.input('color=c=0x111827:s=720x1280:r=25').inputOptions(['-f lavfi', `-t ${totalDuration}`]);
         }
 
-        // تم تصحيح الفلتر بالكامل ليكون متوافقاً مع معايير نظام Linux (Fontsize بحرف صغير)
         let fontStyle = '';
         if (fs.existsSync(localFontPath)) {
             fontStyle = `,Fontname=Amiri,Fontfile=${localFontPath.replace(/\\/g, '/')}`;
@@ -73,7 +87,7 @@ app.post('/api/make-video', async (req, res) => {
 
         command
             .complexFilter([
-                `[1:v]scale=720:1280,subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,Fontsize=22,PrimaryColour=&HFFFFFF,Outline=2,OutlineColour=&H000000${fontStyle}'[v]`
+                `[1:v]scale=720:1280,subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,Fontsize=22,PrimaryColour=&HFFFFFF,Outline=2,OutlineColour=&H000000,MarginV=120,WrapStyle=0${fontStyle}'[v]`
             ])
             .outputOptions(['-map 0:a', '-map [v]', '-pix_fmt yuv420p', '-c:v libx264', '-preset ultrafast', '-c:a aac', '-shortest'])
             .output(outputPath)
