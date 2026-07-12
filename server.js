@@ -6,13 +6,25 @@ const fs = require('fs');
 const app = express();
 app.use(express.json());
 
-// دالة تنظيف علامات الوقف العثمانية الصعبة اللي بتعمل مربعات، مع الحفاظ على التشكيل كاملاً
-function cleanQuranText(text) {
+// دالة تحويل الثواني لتنسيق SRT
+function formatSRTTime(seconds) {
+    if (isNaN(seconds) || seconds < 0) seconds = 0;
+    const date = new Date(0);
+    date.setSeconds(seconds);
+    const timeString = date.toISOString().substr(11, 8);
+    const ms = Math.floor((seconds % 1) * 1000).toString().padStart(3, '0');
+    return `${timeString},${ms}`;
+}
+
+// دالة إجبارية لتنظيف النص تماماً من كل الزخارف والتشكيل العثماني لمنع الـ الكراش والمربعات []
+function stripAllZakhrafa(text) {
     if (!text) return "آية قرآنية";
     return text
-        .replace(/[\u0610-\u0615]/g, "") // حذف علامات الضبط الصغيرة جداً
-        .replace(/[\u06D6-\u06ED]/g, "") // حذف علامات الوقف العثمانية (صلى، قلى، ج، م) المسببة للمربعات
-        .replace(/ٰ/g, "ا")             // تحويل الألف الخنجرية لألف عادية لسلامة الخط
+        .replace(/[\u064B-\u065F]/g, "") // حذف التشكيل بالكامل
+        .replace(/[\u0610-\u0615]/g, "") // حذف علامات الضبط
+        .replace(/[\u06D6-\u06ED]/g, "") // حذف علامات الوقف العثمانية (المسببة للمربعات)
+        .replace(/ٰ/g, "ا")             // تحويل الألف الخنجرية
+        .replace(/[^\u0600-\u06FF\s]/g, "") // حذف أي رموز غريبة خارج الحروف العربية
         .replace(/\s+/g, " ")
         .trim();
 }
@@ -28,6 +40,7 @@ app.post('/api/make-video', async (req, res) => {
     }
 
     const timestamp = Date.now();
+    const srtPath = path.join(__dirname, 'uploads', `sub_${timestamp}.srt`);
     const outputPath = path.join(__dirname, 'uploads', `video_${timestamp}.mp4`);
     const bgImagePath = path.join(__dirname, 'background.jpg'); 
 
@@ -38,84 +51,68 @@ app.post('/api/make-video', async (req, res) => {
     try {
         const firstAyahNum = parseInt(ayahs[0].numberInSurah || 1);
         
-        // حساب توقيت البداية بدقة بناءً على رقم الآية وسورة البقرة
+        // حساب التوقيت التقريبي النظيف للقطع
         let startTimeSeconds = (firstAyahNum - 1) * 6.4; 
         if (parseInt(surah_id) === 2) {
             if (firstAyahNum <= 5) startTimeSeconds = (firstAyahNum - 1) * 7.5;
             else if (firstAyahNum > 5 && firstAyahNum <= 15) startTimeSeconds = 35 + (firstAyahNum - 5) * 5.8;
-            else if (firstAyahNum >= 40 && firstAyahNum <= 50) startTimeSeconds = 248 + (firstAyahNum - 40) * 6.5; // ضبط مخصص للآية 47 بالملي
+            else if (firstAyahNum >= 40 && firstAyahNum <= 50) startTimeSeconds = 248 + (firstAyahNum - 40) * 6.5;
             else startTimeSeconds = (firstAyahNum - 1) * 6.2;
         }
 
-        // التوقيت الديناميكي المرن بناءً على طول الآية (متوسط 0.12 ثانية لكل حرف)
+        // حساب توقيت مرن بناءً على طول النص لضمان التطابق
         let totalDuration = 0;
-        let ayahTimings = [];
+        let srtContent = '';
 
-        ayahs.forEach((ayah) => {
-            const cleanText = cleanQuranText(ayah.text);
-            // حساب المدة: عدد الحروف مضروب في 0.12 ثانية (على ألا تقل عن 5 ثوانٍ ولا تزيد عن 12 ثانية للآية)
-            let duration = Math.max(5, Math.min(12, cleanText.length * 0.12));
+        ayahs.forEach((ayah, index) => {
+            const cleanText = stripAllZakhrafa(ayah.text);
+            let duration = Math.max(5, Math.min(11, cleanText.length * 0.12));
             
-            ayahTimings.push({
-                text: cleanText,
-                start: totalDuration,
-                end: totalDuration + duration
-            });
+            const start = totalDuration;
+            const end = totalDuration + duration;
+
+            srtContent += `${index + 1}\n`;
+            srtContent += `${formatSRTTime(start)} --> ${formatSRTTime(end)}\n`;
+            srtContent += `${cleanText}\n\n`;
+
             totalDuration += duration;
         });
 
-        let filters = [];
-        // بناء الخلفية (الصورة أو اللون الافتراضي)
-        if (fs.existsSync(bgImagePath)) {
-            filters.push(`[1:v]scale=720:1280,loop=loop=-1:size=1:start=0[bg_scaled]`);
-        } else {
-            filters.push(`color=c=0x111827:s=720x1280:r=25:d=${totalDuration}[bg_scaled]`);
-        }
-
-        let currentInput = '[bg_scaled]';
-
-        // رسم النصوص أوتوماتيك بـ drawtext مع تقسيم السطور الذكي لمنع خروج الكلام بره الشاشة
-        ayahTimings.forEach((ayah, index) => {
-            const outputLabel = `v${index}`;
-            
-            // تقسيم النص لنصفين لو كان طويلاً جداً عشان ينزل على سطرين شيك
-            let textParam = ayah.text;
-            if (textParam.length > 40) {
-                const middle = Math.floor(textParam.length / 2);
-                const spaceIndex = textParam.indexOf(' ', middle);
-                if (spaceIndex !== -1) {
-                    textParam = textParam.substring(0, spaceIndex) + '\n' + textParam.substring(spaceIndex + 1);
-                }
-            }
-
-            filters.push(
-                `${currentInput}drawtext=text='${textParam}':fontcolor=white:fontsize=26:line_spacing=15:x=(w-text_w)/2:y=(h-text_h)/2:enable='between(t,${ayah.start},${ayah.end})'[${outputLabel}]`
-            );
-            currentInput = `[${outputLabel}]`;
-        });
+        // حفظ ملف الترجمة بترميز UTF-8 نظيف وصريح ومتوافق مع Linux
+        fs.writeFileSync(srtPath, srtContent, 'utf-8');
 
         let command = ffmpeg().input(audioUrl).inputOptions([`-ss ${startTimeSeconds}`, `-t ${totalDuration}`]);
+
         if (fs.existsSync(bgImagePath)) {
-            command.input(bgImagePath);
+            command.input(bgImagePath).inputOptions(['-loop 1', `-t ${totalDuration}`]);
+        } else {
+            command.input('color=c=0x111827:s=720x1280:r=25').inputOptions(['-f lavfi', `-t ${totalDuration}`]);
         }
 
         command
-            .complexFilter(filters, currentInput)
+            .complexFilter([
+                // استخدام الـ subtitles الخفيف الافتراضي بدون فرض أسماء خطوط معقدة لضمان السرعة والـ ثبات
+                `[1:v]scale=720:1280,subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,Fontsize=22,PrimaryColour=&HFFFFFF,Outline=1,OutlineColour=&H000000,MarginV=140'[v]`
+            ])
             .outputOptions([
+                '-map 0:a',          
+                '-map [v]',          
                 '-pix_fmt yuv420p',
                 '-c:v libx264',
-                '-preset ultrafast',
+                '-preset ultrafast', // أسرع إعداد رندر في العالم عشان نمنع الـ Timeout
                 '-c:a aac',
                 '-shortest'
             ])
             .output(outputPath)
             .on('end', () => {
+                if (fs.existsSync(srtPath)) fs.unlinkSync(srtPath);
                 res.download(outputPath, 'quran_reel.mp4', () => {
                     if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
                 });
             })
             .on('error', (err) => {
                 console.error("FFmpeg error:", err);
+                if (fs.existsSync(srtPath)) fs.unlinkSync(srtPath);
                 if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
                 res.status(500).json({ success: false, error: err.message });
             })
@@ -123,9 +120,10 @@ app.post('/api/make-video', async (req, res) => {
 
     } catch (e) {
         console.error("Error:", e);
+        if (fs.existsSync(srtPath)) fs.unlinkSync(srtPath);
         res.status(500).json({ success: false, error: e.message });
     }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Quran Reels Generator Running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Super Fast Quran Reels Generator Running on port ${PORT}`));
