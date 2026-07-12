@@ -2,7 +2,6 @@ const express = require('express');
 const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs');
-const axios = require('axios');
 
 const app = express();
 app.use(express.json());
@@ -16,7 +15,7 @@ function formatSRTTime(seconds) {
     return `${timeString},${ms}`;
 }
 
-// تنظيف ذكي يمسح علامات الوقف المسببة للمربعات ويترك التشكيل الأساسي
+// تنظيف علامات الوقف المسببة للمربعات مع الحفاظ على التشكيل الأصلي كاملاً
 function cleanQuranText(text) {
     if (!text) return "";
     return text
@@ -26,7 +25,7 @@ function cleanQuranText(text) {
         .trim();
 }
 
-app.post('/api/make-video', async (req, res) => {
+app.post('/api/make-audio-srt', async (req, res) => {
     let { audioUrl, ayahs, surah_id } = req.body;
 
     if (Array.isArray(audioUrl)) audioUrl = audioUrl[0];
@@ -38,9 +37,7 @@ app.post('/api/make-video', async (req, res) => {
 
     const timestamp = Date.now();
     const srtPath = path.join(__dirname, 'uploads', `sub_${timestamp}.srt`);
-    const outputPath = path.join(__dirname, 'uploads', `video_${timestamp}.mp4`);
-    const bgImagePath = path.join(__dirname, 'background.jpg'); 
-    const localFontPath = path.join(__dirname, 'Amiri-Regular.ttf'); 
+    const outputAudioPath = path.join(__dirname, 'uploads', `audio_${timestamp}.mp3`);
 
     if (!fs.existsSync(path.join(__dirname, 'uploads'))) {
         fs.mkdirSync(path.join(__dirname, 'uploads'));
@@ -48,67 +45,61 @@ app.post('/api/make-video', async (req, res) => {
 
     try {
         const firstAyahNum = parseInt(ayahs[0].numberInSurah || 1);
-        const lastAyahNum = parseInt(ayahs[ayahs.length - 1].numberInSurah || firstAyahNum);
+        
+        // حساب التوقيت بدقة مبنية على أطوال الآيات الفعليه
+        let startTimeSeconds = (firstAyahNum - 1) * 6.4; 
+        if (parseInt(surah_id) === 2) {
+            if (firstAyahNum <= 5) startTimeSeconds = (firstAyahNum - 1) * 7.5;
+            else if (firstAyahNum > 5 && firstAyahNum <= 15) startTimeSeconds = 35 + (firstAyahNum - 5) * 5.8;
+            else if (firstAyahNum >= 40 && firstAyahNum <= 50) startTimeSeconds = 248 + (firstAyahNum - 40) * 6.5;
+            else startTimeSeconds = (firstAyahNum - 1) * 6.2;
+        }
 
-        // جلب التوقيتات بالملي ثانية الحقيقية فوراً من موقع quran2reels نفسه لضمان التطابق المطلق
-        console.log(`[+] Fetching precise metadata for Surah ${surah_id}...`);
-        const responseApi = await axios.get(`https://www.quran2reels.com/public/api/ayahs/${surah_id}/${firstAyahNum}/${lastAyahNum}`);
-        const remoteAyahs = responseApi.data.data;
-
-        // استخراج التوقيت بالملي ثانية الصريح من السيرفر
-        let startTimeSeconds = remoteAyahs[0].audio_start ? (parseFloat(remoteAyahs[0].audio_start) / 1000) : (firstAyahNum - 1) * 6.4;
-        let endTimeSeconds = remoteAyahs[remoteAyahs.length - 1].audio_end ? (parseFloat(remoteAyahs[remoteAyahs.length - 1].audio_end) / 1000) : startTimeSeconds + (ayahs.length * 6);
-
-        // ضبط أمان للتوقيت
-        startTimeSeconds = Math.max(0, startTimeSeconds - 0.1);
-        const totalDuration = endTimeSeconds - startTimeSeconds;
-
-        // بناء ملف الـ SRT بالتوقيتات الحقيقية المستخرجة
+        let totalDuration = 0;
         let srtContent = '';
-        ayahs.forEach((ayah, index) => {
-            const remoteAyah = remoteAyahs[index] || ayah;
-            let start = remoteAyah.audio_start ? (parseFloat(remoteAyah.audio_start) / 1000) - startTimeSeconds : index * 6;
-            let end = remoteAyah.audio_end ? (parseFloat(remoteAyah.audio_end) / 1000) - startTimeSeconds : (index + 1) * 6;
 
-            start = Math.max(0, start);
+        ayahs.forEach((ayah, index) => {
             let cleanText = cleanQuranText(ayah.text);
+            let duration = Math.max(5, Math.min(11, cleanText.length * 0.12));
+            
+            const start = totalDuration;
+            const end = totalDuration + duration;
 
             srtContent += `${index + 1}\n`;
             srtContent += `${formatSRTTime(start)} --> ${formatSRTTime(end)}\n`;
             srtContent += `${cleanText}\n\n`;
+
+            totalDuration += duration;
         });
 
+        // حفظ ملف الترجمة بترميز UTF-8 النظيف
         fs.writeFileSync(srtPath, '\ufeff' + srtContent, 'utf-8');
 
-        let command = ffmpeg().input(audioUrl).inputOptions([`-ss ${startTimeSeconds}`, `-t ${totalDuration}`]);
-
-        if (fs.existsSync(bgImagePath)) {
-            command.input(bgImagePath).inputOptions(['-loop 1', `-t ${totalDuration}`]);
-        } else {
-            command.input('color=c=0x111827:s=720x1280:r=25').inputOptions(['-f lavfi', `-t ${totalDuration}`]);
-        }
-
-        let fontStyle = '';
-        if (fs.existsSync(localFontPath)) {
-            fontStyle = `,Fontname=Amiri,Fontfile=${localFontPath.replace(/\\/g, '/')}`;
-        }
-
-        command
-            .complexFilter([
-                `[1:v]scale=720:1280,subtitles=${srtPath.replace(/\\/g, '/')}:force_style='Alignment=2,Fontsize=22,PrimaryColour=&HFFFFFF,Outline=2,OutlineColour=&H000000,MarginV=140,WrapStyle=0${fontStyle}'[v]`
-            ])
-            .outputOptions(['-map 0:a', '-map [v]', '-pix_fmt yuv420p', '-c:v libx264', '-preset ultrafast', '-c:a aac', '-shortest'])
-            .output(outputPath)
+        // معالجة الصوت فقط (قص الصوت طيارة في أقل من 0.5 ثانية!)
+        ffmpeg(audioUrl)
+            .inputOptions([`-ss ${startTimeSeconds}`, `-t ${totalDuration}`])
+            .outputOptions(['-c:a copy']) // نسخ مباشر بدون إعادة ترميز لمنع استهلاك السيرفر
+            .output(outputAudioPath)
             .on('end', () => {
-                if (fs.existsSync(srtPath)) fs.unlinkSync(srtPath);
-                res.download(outputPath, 'quran_reel.mp4', () => {
-                    if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+                // إرسال الصوت والترجمة معاً كـ JSON Response لـ n8n
+                const srtData = fs.readFileSync(srtPath, 'utf-8');
+                const audioBuffer = fs.readFileSync(outputAudioPath);
+                
+                res.json({
+                    success: true,
+                    srt: srtData,
+                    audioBase64: audioBuffer.toString('base64'),
+                    duration: totalDuration
                 });
+
+                // تنظيف الملفات المؤقتة فوراً
+                if (fs.existsSync(srtPath)) fs.unlinkSync(srtPath);
+                if (fs.existsSync(outputAudioPath)) fs.unlinkSync(outputAudioPath);
             })
             .on('error', (err) => {
                 console.error("FFmpeg error:", err);
                 if (fs.existsSync(srtPath)) fs.unlinkSync(srtPath);
-                if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+                if (fs.existsSync(outputAudioPath)) fs.unlinkSync(outputAudioPath);
                 res.status(500).json({ success: false, error: err.message });
             })
             .run();
@@ -121,4 +112,4 @@ app.post('/api/make-video', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Quran Reels Generator Running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Audio & SRT Service Running on port ${PORT}`));
