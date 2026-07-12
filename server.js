@@ -2,6 +2,7 @@ const express = require('express');
 const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs');
+const axios = require('axios');
 
 const app = express();
 app.use(express.json());
@@ -15,12 +16,12 @@ function formatSRTTime(seconds) {
     return `${timeString},${ms}`;
 }
 
-// تنظيف ذكي: يمسح فقط علامات الوقف اللي بتعمل مربعات، ويحافظ على التشكيل والألف الخنجرية
+// تنظيف ذكي يمسح علامات الوقف المسببة للمربعات ويترك التشكيل الأساسي
 function cleanQuranText(text) {
-    if (!text) return "آية قرآنية";
+    if (!text) return "";
     return text
-        .replace(/[\u0610-\u0615]/g, "") // حذف علامات الضبط الصغيرة
-        .replace(/[\u06D6-\u06ED]/g, "") // حذف علامات الوقف العثمانية (المسببة للمربعات)
+        .replace(/[\u0610-\u0615]/g, "") 
+        .replace(/[\u06D6-\u06ED]/g, "") 
         .replace(/\s+/g, " ")
         .trim();
 }
@@ -32,7 +33,7 @@ app.post('/api/make-video', async (req, res) => {
     if (typeof audioUrl === 'string') audioUrl = audioUrl.replace(/[\[\]]/g, '').trim();
 
     if (!audioUrl || !ayahs || ayahs.length === 0) {
-        return res.status(400).json({ success: false, message: 'Invalid or missing parameters' });
+        return res.status(400).json({ success: false, message: 'Invalid parameters' });
     }
 
     const timestamp = Date.now();
@@ -46,32 +47,28 @@ app.post('/api/make-video', async (req, res) => {
     }
 
     try {
-        // قراءة التوقيتات الحقيقية بالملي ثانية مباشرة من الـ API الممرر من n8n
-        // الـ API بيبعت الحقول دي لكل آية: audio_start و audio_end (أو ما يماثلها، تأكد منها في نود n8n)
-        let startTimeSeconds = ayahs[0].audio_start ? (parseFloat(ayahs[0].audio_start) / 1000) : null;
-        let endTimeSeconds = ayahs[ayahs.length - 1].audio_end ? (parseFloat(ayahs[ayahs.length - 1].audio_end) / 1000) : null;
-
         const firstAyahNum = parseInt(ayahs[0].numberInSurah || 1);
+        const lastAyahNum = parseInt(ayahs[ayahs.length - 1].numberInSurah || firstAyahNum);
 
-        // fallback لو الحقول مش موجودة بنفس الاسم بالظبط
-        if (startTimeSeconds === null) {
-            startTimeSeconds = (firstAyahNum - 1) * 6.4; 
-            if (parseInt(surah_id) === 2) {
-                if (firstAyahNum <= 5) startTimeSeconds = (firstAyahNum - 1) * 7.5;
-                else if (firstAyahNum > 5 && firstAyahNum <= 15) startTimeSeconds = 35 + (firstAyahNum - 5) * 5.8;
-                else if (firstAyahNum >= 40 && firstAyahNum <= 50) startTimeSeconds = 248 + (firstAyahNum - 40) * 6.5;
-                else startTimeSeconds = (firstAyahNum - 1) * 6.2;
-            }
-        }
+        // جلب التوقيتات بالملي ثانية الحقيقية فوراً من موقع quran2reels نفسه لضمان التطابق المطلق
+        console.log(`[+] Fetching precise metadata for Surah ${surah_id}...`);
+        const responseApi = await axios.get(`https://www.quran2reels.com/public/api/ayahs/${surah_id}/${firstAyahNum}/${lastAyahNum}`);
+        const remoteAyahs = responseApi.data.data;
 
-        const durationPerAyah = 6;
-        const totalDuration = endTimeSeconds ? (endTimeSeconds - startTimeSeconds) : (ayahs.length * durationPerAyah);
+        // استخراج التوقيت بالملي ثانية الصريح من السيرفر
+        let startTimeSeconds = remoteAyahs[0].audio_start ? (parseFloat(remoteAyahs[0].audio_start) / 1000) : (firstAyahNum - 1) * 6.4;
+        let endTimeSeconds = remoteAyahs[remoteAyahs.length - 1].audio_end ? (parseFloat(remoteAyahs[remoteAyahs.length - 1].audio_end) / 1000) : startTimeSeconds + (ayahs.length * 6);
 
-        // بناء ملف الـ SRT بناءً على توقيتات الآيات الحقيقية
+        // ضبط أمان للتوقيت
+        startTimeSeconds = Math.max(0, startTimeSeconds - 0.1);
+        const totalDuration = endTimeSeconds - startTimeSeconds;
+
+        // بناء ملف الـ SRT بالتوقيتات الحقيقية المستخرجة
         let srtContent = '';
         ayahs.forEach((ayah, index) => {
-            let start = ayah.audio_start ? (parseFloat(ayah.audio_start) / 1000) - startTimeSeconds : index * durationPerAyah;
-            let end = ayah.audio_end ? (parseFloat(ayah.audio_end) / 1000) - startTimeSeconds : (index + 1) * durationPerAyah;
+            const remoteAyah = remoteAyahs[index] || ayah;
+            let start = remoteAyah.audio_start ? (parseFloat(remoteAyah.audio_start) / 1000) - startTimeSeconds : index * 6;
+            let end = remoteAyah.audio_end ? (parseFloat(remoteAyah.audio_end) / 1000) - startTimeSeconds : (index + 1) * 6;
 
             start = Math.max(0, start);
             let cleanText = cleanQuranText(ayah.text);
@@ -91,7 +88,6 @@ app.post('/api/make-video', async (req, res) => {
             command.input('color=c=0x111827:s=720x1280:r=25').inputOptions(['-f lavfi', `-t ${totalDuration}`]);
         }
 
-        // استخدام الخط المحلي Amiri-Regular.ttf اللي رفعناه لمنع المربعات مع التشكيل
         let fontStyle = '';
         if (fs.existsSync(localFontPath)) {
             fontStyle = `,Fontname=Amiri,Fontfile=${localFontPath.replace(/\\/g, '/')}`;
